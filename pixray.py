@@ -1047,10 +1047,11 @@ def ascend_txt(args):
         cur_loss = F.cosine_embedding_loss(f, f2, y) * args.init_weight_cos
         result.append(cur_loss)
 
-    if args.make_video:    
-        img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
-        img = np.transpose(img, (1, 2, 0))
-        imageio.imwrite(f'{output_path(args)}/frame_{cur_iteration:04d}.png', np.array(img))
+    if args.make_video:
+        if cur_iteration % 5 == 0:       
+            img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
+            img = np.transpose(img, (1, 2, 0))
+            imageio.imwrite(f'{output_path(args)}/frame_{cur_iteration:04d}.png', np.array(img))
 
     return result
 
