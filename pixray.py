@@ -799,6 +799,9 @@ num_loss_drop = 0
 max_loss_drops = 2
 iter_drop_delay = 20
 
+def output_path(args):
+    return os.path.dirname(args.output)
+
 def make_gif(args, iter):
     gif_output = os.path.join(args.animation_dir, "anim.gif")
     if os.path.exists(gif_output):
@@ -1047,7 +1050,7 @@ def ascend_txt(args):
     if args.make_video:    
         img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
         img = np.transpose(img, (1, 2, 0))
-        imageio.imwrite(f'./steps/frame_{cur_iteration:04d}.png', np.array(img))
+        imageio.imwrite(f'{output_path(args)}/frame_{cur_iteration:04d}.png', np.array(img))
 
     return result
 
@@ -1262,8 +1265,8 @@ def do_run(args):
         except KeyboardInterrupt:
             pass
 
-    if args.make_video:
-        do_video(args)
+    #if args.make_video:
+    #    do_video(args)
 
 def do_video(args):
     global cur_iteration
@@ -1513,8 +1516,8 @@ def process_args(vq_parser, namespace=None):
 
     # Make video steps directory
     if args.make_video:
-        if not os.path.exists('steps'):
-            os.mkdir('steps')
+        if not os.path.exists(output_path(args)):
+            os.mkdir(output_path(args))
 
     if args.learning_rate_drops is None:
         args.learning_rate_drops = []
