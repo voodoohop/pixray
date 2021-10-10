@@ -43,6 +43,8 @@ import random
 
 from einops import rearrange
 
+from colorlookup import ColorLookup
+
 from PIL import ImageFile, Image, PngImagePlugin
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -394,7 +396,7 @@ def resize_image(image, out_size):
 
 def rebuild_optimisers(args):
     global best_loss, best_iter, best_z, num_loss_drop, max_loss_drops, iter_drop_delay
-    global drawer
+    global drawer, color_mapper
 
     drop_divisor = 10 ** num_loss_drop
     new_opts = drawer.get_opts(drop_divisor)
@@ -445,13 +447,15 @@ def do_image_features(model, images, image_mean, image_std):
 
     return image_features
 
-
+# note: this should probably be split into a setup and a session init
 def do_init(args):
     global opts, perceptors, normalize, cutoutsTable, cutoutSizeTable
     global z_orig, im_targets, z_labels, init_image_tensor, target_image_tensor
     global gside_X, gside_Y, overlay_image_rgba, overlay_image_rgba_list, init_image_rgba_list
     global pmsTable, pmsImageTable, pmsTargetTable, pImages, device, spotPmsTable, spotOffPmsTable
-    global drawer
+    global drawer, color_mapper
+
+    reset_session_globals()
 
     # do seed first!
     if args.seed is None:
@@ -464,8 +468,9 @@ def do_init(args):
     np.random.seed(int_seed)
     random.seed(int_seed)
 
-    # Do it (init that is)
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    # set device only once
+    if device is None:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     drawer = class_table[args.drawer](args)
     drawer.load_model(args, device)
@@ -482,15 +487,31 @@ def do_init(args):
     gside_X = sideX
     gside_Y = sideY
 
-    for clip_model in args.clip_models:
-        perceptor = clip.load(clip_model, jit=jit)[0].eval().requires_grad_(False).to(device)
-        perceptors[clip_model] = perceptor
+    # model loading optimization: if all models are loaded keep things as they are
+    if set(args.clip_models) <= set(perceptors.keys()):
+        print("All CLIP models already loaded: ", args.clip_models)
+    else:
+        # TODO: unload models?
+        perceptors = {}
+        for clip_model in args.clip_models:
+            perceptor = clip.load(clip_model, jit=jit, download_root="models")[0].eval().requires_grad_(False).to(device)
+            perceptors[clip_model] = perceptor
 
+    # now separately setup cuts
+    for clip_model in args.clip_models:
+        perceptor = perceptors[clip_model]
         cut_size = perceptor.visual.input_resolution
         cutoutSizeTable[clip_model] = cut_size
         if not cut_size in cutoutsTable:    
             make_cutouts = MakeCutouts(cut_size, args.num_cuts, cut_pow=args.cut_pow)
             cutoutsTable[cut_size] = make_cutouts
+
+    if args.color_mapper is not None:
+        if args.color_mapper == "lookup":
+            color_mapper = ColorLookup(args.target_palette, device=device)
+        else:
+            print(f"Color mapper {args.color_mapper} not understood")
+            sys.exit(1)
 
     init_image_tensor = None
     target_image_tensor = None
@@ -763,17 +784,17 @@ def do_init(args):
     if args.noise_prompt_weights:
         print('Noise prompt weights:', args.noise_prompt_weights)
 
+    cur_iteration = 0
 
-# dreaded globals (for now)
+
+# dreaded unsorted globals (for now)
 z_orig = None
 im_targets = None
 z_labels = None
 opts = None
 drawer = None
-perceptors = {}
+color_mapper = None
 normalize = None
-cutoutsTable = {}
-cutoutSizeTable = {}
 init_image_tensor = None
 target_image_tensor = None
 pmsTable = None
@@ -786,7 +807,6 @@ gside_Y=None
 init_image_rgba_list=[]
 overlay_image_rgba_list=None
 overlay_image_rgba=None
-device=None
 cur_iteration=None
 cur_anim_index=None
 anim_output_files=[]
@@ -799,8 +819,20 @@ num_loss_drop = 0
 max_loss_drops = 2
 iter_drop_delay = 20
 
-def output_path(args):
-    return os.path.dirname(args.output)
+# session globals
+cutoutsTable = {}
+cutoutSizeTable = {}
+
+# persistent globals
+perceptors = {}
+device=None
+
+
+# on re-runs this should reset most important globals
+def reset_session_globals():
+    global cutoutsTable, cutoutSizeTable
+    cutoutsTable = {}
+    cutoutSizeTable = {}
 
 def make_gif(args, iter):
     gif_output = os.path.join(args.animation_dir, "anim.gif")
@@ -844,7 +876,7 @@ def checkdrop(args, iter, losses):
 
 @torch.no_grad()
 def checkin(args, iter, losses):
-    global drawer
+    global drawer, color_mapper
     global best_loss, best_iter, best_z, num_loss_drop, max_loss_drops, iter_drop_delay
 
     num_cycles_not_best = iter - best_iter
@@ -862,6 +894,8 @@ def checkin(args, iter, losses):
     info = PngImagePlugin.PngInfo()
     info.add_text('comment', f'{args.prompts}')
     timg = drawer.synth(cur_iteration)
+    if color_mapper is not None:
+        timg, closs = color_mapper(timg);
     img = TF.to_pil_image(timg[0].cpu())
     # img = drawer.to_image()
     if cur_anim_index is None:
@@ -891,6 +925,10 @@ def ascend_txt(args):
     out = drawer.synth(cur_iteration);
 
     result = []
+
+    if color_mapper is not None:
+        out, c_loss = color_mapper(out);
+        result.append(c_loss);
 
     if (cur_iteration%2 == 0):
         global_padding_mode = 'reflection'
@@ -1176,11 +1214,11 @@ def check_new_filelist(filelist_old_source, filelist_old, filelist_cur_source, f
         print(f"==> anim filelist {filelist_cur_source} has {len(filelist_cur)} files - switching from {filelist_old_source}")
         return filelist_cur_source, filelist_cur
 
-def do_run(args):
+# return only once to run only one iteration
+# returns True when complete, False otherwise
+def do_run(args, return_display=False):
     global cur_iteration, cur_anim_index
     global anim_cur_zs, anim_next_zs, anim_output_files
-
-    cur_iteration = 0
 
     if args.animation_dir is not None:
         # we already have z_targets. setup some sort of global ring
@@ -1258,7 +1296,11 @@ def do_run(args):
                         if cur_iteration == args.iterations:
                             break
                         cur_iteration += 1
-                        pbar.update()
+                        if not hasattr(args, 'skip_args'):
+                            pbar.update()
+                        if keep_going and return_display and cur_iteration % args.display_every == 0:
+                            # print("Returning after iteration ", cur_iteration)
+                            return False
                     except RuntimeError as e:
                         print("Oops: runtime error: ", e)
                         print("Try reducing --num-cuts to save memory")
@@ -1268,6 +1310,8 @@ def do_run(args):
 
     #if args.make_video:
     #    do_video(args)
+
+    return True
 
 def do_video(args):
     global cur_iteration
@@ -1369,7 +1413,7 @@ def setup_parser(vq_parser):
     vq_parser.add_argument("-o",    "--output", type=str, help="Output file", default="output.png", dest='output')
     vq_parser.add_argument("-vid",  "--video", type=bool, help="Create video frames?", default=False, dest='make_video')
     vq_parser.add_argument("-d",    "--deterministic", type=bool, help="Enable cudnn.deterministic?", default=False, dest='cudnn_determinism')
-    vq_parser.add_argument("-mo",   "--do_mono", type=bool, help="Monochromatic", default=False, dest='do_mono')
+    vq_parser.add_argument("-cm",   "--color_mapper", type=str, help="Color Mapping", default=None, dest='color_mapper')
     vq_parser.add_argument("-epw",  "--enforce_palette_annealing", type=int, help="enforce palette annealing, 0 -- skip", default=5000, dest='enforce_palette_annealing')
     vq_parser.add_argument("-tp",   "--target_palette", type=str, help="target palette", default=None, dest='target_palette')
     vq_parser.add_argument("-tpl",  "--target_palette_length", type=int, help="target palette length", default=16, dest='target_palette_length')
@@ -1389,42 +1433,54 @@ def process_args(vq_parser, namespace=None):
     global best_loss, best_iter, best_z, num_loss_drop, max_loss_drops, iter_drop_delay
 
     if namespace == None:
-      # command line: use ARGV to get args
-      args = vq_parser.parse_args()
-    elif isnotebook():
-      args = vq_parser.parse_args(args=[], namespace=namespace)
+        # command line: use ARGV to get args
+        args = vq_parser.parse_args()
+    elif isnotebook() or hasattr(namespace, 'skip_args'):
+        args = vq_parser.parse_args(args=[], namespace=namespace)
     else:
-      # sometimes there are both settings and cmd line
-      args = vq_parser.parse_args(namespace=namespace)        
+        # sometimes there are both settings and cmd line
+        args = vq_parser.parse_args(namespace=namespace)        
 
     if args.cudnn_determinism:
-       torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.deterministic = True
 
     quality_to_clip_models_table = {
         'draft': 'ViT-B/32',
         'normal': 'ViT-B/32,ViT-B/16',
         'better': 'RN50,ViT-B/32,ViT-B/16',
-        'best': 'RN50x4,ViT-B/32,ViT-B/16'
+        'best': 'RN50x4,ViT-B/32,ViT-B/16',
+        'supreme': 'RN50x16,ViT-B/32,ViT-B/16'
     }
     quality_to_iterations_table = {
         'draft': 200,
-        'normal': 300,
-        'better': 400,
-        'best': 500
+        'normal': 250,
+        'better': 300,
+        'best': 350,
+        'supreme': 400
     }
     quality_to_scale_table = {
         'draft': 1,
         'normal': 2,
         'better': 3,
-        'best': 4
+        'best': 4,
+        'supreme': 5
     }
     # this should be replaced with logic that does somethings
     # smart based on available memory (eg: size, num_models, etc)
     quality_to_num_cuts_table = {
-        'draft': 40,
-        'normal': 40,
-        'better': 40,
-        'best': 40
+        'draft': 32,
+        'normal': 48,
+        'better': 32,
+        'best': 10,
+        'supreme': 8
+    }
+
+    quality_to_batches_table = {
+        'draft': 1,
+        'normal': 1,
+        'better': 2,
+        'best': 8,
+        'supreme': 12
     }
 
     if args.quality not in quality_to_clip_models_table:
@@ -1437,6 +1493,8 @@ def process_args(vq_parser, namespace=None):
         args.iterations = quality_to_iterations_table[args.quality]
     if args.num_cuts is None:
         args.num_cuts = quality_to_num_cuts_table[args.quality]
+    if args.batches is None:
+        args.batches = quality_to_batches_table[args.quality]
     if args.ezsize is None and args.scale is None:
         args.scale = quality_to_scale_table[args.quality]
 
@@ -1578,7 +1636,7 @@ def apply_settings():
         # check for any bogus entries in the settings
         dests = [d.dest for d in vq_parser._actions]
         for k in global_pixray_settings:
-            if not k in dests:
+            if not k in dests and k != "skip_args":
                 raise ValueError(f"Requested setting not found, aborting: {k}={global_pixray_settings[k]}")
 
         # convert dictionary to easyDict
