@@ -82,6 +82,9 @@ except ImportError:
     pass
 
 
+def output_path(args):
+    return os.path.dirname(args.output)
+
 # this is enabled when not in the master branch
 # print("warning: running unreleased future version")
 
@@ -852,6 +855,8 @@ def make_gif(args, iter):
 #   -framerate 10 -pattern_type glob \
 #   -i '{animation_output}/*_*.png' \
 #   -loop 0 {animation_output}/final.gif
+
+
 
 @torch.no_grad()
 def checkdrop(args, iter, losses):
